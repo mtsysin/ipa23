@@ -9,7 +9,7 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP 
 from torch.distributed import init_process_group, destroy_process_group
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 
 from model.YoloMulti import YoloMulti
 from model.DumbNet import DumbNet
@@ -21,8 +21,8 @@ from utils import Reduce_255
 import matplotlib.pyplot as plt
 import tqdm
 import math
-from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter('runs/prototype_lane')
+# from torch.utils.tensorboard import SummaryWriter
+# writer = SummaryWriter('runs/prototype_lane')
 
 torch.autograd.detect_anomaly(True)
 torch.autograd.set_detect_anomaly(True, check_nan=True)

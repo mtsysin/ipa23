@@ -7,6 +7,10 @@ from PIL import Image
 import torch
 import torch.utils.data as data
 from torchvision.io import read_image
+import torchvision.transforms.v2 as transforms
+from torchvision import tv_tensors
+import random
+from augmentation import mosaic_augmentation, cls_bbox_augment, mixup_augmentation
 
 from utils import DetectionUtils
 
@@ -31,17 +35,31 @@ CLASS_DICT = {
             'other person':     12,
         }
 REVERSE_CLASS_DICT = {value: key for key, value in CLASS_DICT.items()}
-THRESH = 10         # Threshold for object area
+BBOX_SIZE_THRESHOLD = None         # Threshold for object area
+MOSAIC_PROB = 1.0
+AUGMENT_PROB = 1.0
+MIXUP_AFTER_MOS = 0
+MIXUP_PROB = 1.0
+
 
 class BDD100k(data.DataLoader):
 
-    def __init__(self, root, train=True, transform=None, S=GRID_SCALES, anchors=ANCHORS):
+    def __init__(self, 
+            root, 
+            dataset_type = 'train', 
+            transform=None, 
+            S=GRID_SCALES, 
+            anchors=ANCHORS,
+            target = 'yolo'
+        ):
         self.root = root 
-        self.train = train
+        self.dataset_type = dataset_type
         self.transform = transform
         self.utils = DetectionUtils()
+        self.target = target
+        
 
-        self.detect = pd.read_json(self.root + 'labels/det_20/det_train.json') if train else pd.read_json(self.root + 'labels/det_20/det_val.json')
+        self.detect = pd.read_json(self.root + 'labels/det_20/det_train.json') if self.dataset_type == 'train' else pd.read_json(self.root + 'labels/det_20/det_val.json')
         self.detect.dropna(axis=0, subset=['labels'], inplace=True)
 
         self.class_dict = CLASS_DICT
@@ -57,8 +75,8 @@ class BDD100k(data.DataLoader):
         self.ignore_iou_thresh = 0.5
 
         #Initialize paths:
-        self.img_path = self.root + 'images/100k/train/' if self.train else self.root + 'images/100k/val/'
-        self.lane_path = self.root + 'labels/lane/masks/train/' if self.train else self.root + 'labels/lane/masks/val/'
+        self.img_path = self.root + 'images/100k/train/' if self.dataset_type == 'train' else self.root + 'images/100k/val/'
+        self.lane_path = self.root + 'labels/lane/masks/train/' if self.dataset_type == 'train' else self.root + 'labels/lane/masks/val/'
 
         
     def __len__(self):
@@ -73,36 +91,101 @@ class BDD100k(data.DataLoader):
         union = (box[...,0] * box[...,1] + anchor[...,0] * anchor[...,1]) - intersection
 
         return intersection / union
-  
-    def __getitem__(self, index):
-        target = self.detect.iloc[index]
-
-        img = read_image(self.img_path + target['name']) 
-
-        img = img.type(torch.float32)
+    
+    def load_cls_bboxes(self, index, enforce_type = None):
+        # Load image information (class and bounding box); convert bbox format (to x_c, y_c, w, h), keep them unscaled.
+        annotations = self.detect.iloc[index]['labels']
+        bboxes = []
+        for obj in annotations:
+            obj_class = self.class_dict[obj['category']]
+            bbox = list(obj['box2d'].values())
+            _, _, w, h = self.utils.xyxy_to_xywh(bbox) 
+            if BBOX_SIZE_THRESHOLD and (w < BBOX_SIZE_THRESHOLD or h < BBOX_SIZE_THRESHOLD):
+                continue
+            box_tensor = torch.Tensor(([obj_class] + bbox))
+            bboxes.append(box_tensor) 
+        return torch.stack(bboxes).to(enforce_type) if enforce_type else torch.stack(bboxes)
+    
+    def load_img_and_bboxes(self, index, augmentations = None, enforce_bbox_type = None):
+        img = read_image(self.img_path + self.detect.iloc[index]['name'])
+        bboxes = self.load_cls_bboxes(index, enforce_type=enforce_bbox_type)
+        
         _, height, width = img.shape
+        # print(img.shape)
+        # print(img[:, 2:4, 5:7])
+        # print(bboxes)
+
+
+        augmentation_scheme = self._get_augmentatiion_scheme((height, width))
+
+        if random.random() < AUGMENT_PROB:
+            img, bboxes = self.cls_bbox_augment(augmentation_scheme, img, bboxes)
+
+        return img, bboxes
+
+    def _get_augmentatiion_scheme(self, size):
+        return transforms.Compose([
+            transforms.RandomPerspective(distortion_scale=0.5, p=1, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.RandomResizedCrop(size=size, antialias=True),
+            transforms.RandomHorizontalFlip(p=1),
+            transforms.ClampBoundingBoxes(),
+            transforms.SanitizeBoundingBoxes(),
+            transforms.RandomPhotometricDistort(),
+        ])
+    
+    def cls_bbox_augment(self, augmentation, image, bboxes):
+        return cls_bbox_augment(augmentation, image, bboxes)
+    
+    def load_mosaic(self, base_index):
+        # get random indices to build a mosaic augmentation:
+        idxs = [base_index]
+        while len(idxs) < 4:
+            candidate = random.randint(0, self.__len__() - 1)
+            if candidate not in idxs:
+                idxs.append(candidate)
+
+        images, bboxes_l = zip(*[list(self.load_img_and_bboxes(i)) for i in idxs])
+
+        return mosaic_augmentation(images, bboxes_l)
+
+    def __getitem__(self, index):
+       
+        if random.random() < MOSAIC_PROB:       # Run mosaic
+            img, bboxes = self.load_mosaic(index)
+            if random.random() < MIXUP_AFTER_MOS:       # Run mixup with mosaics
+                img_2, bboxes_2 = self.load_mosaic(random.randint(0, self.__len__() - 1))
+                img, bboxes = mixup_augmentation(img, bboxes, img_2, bboxes_2)
+        elif random.random() < MIXUP_PROB:                                   # Just run simple augmentations
+            # Choose another index:
+            idx_2 = index
+            while idx_2 == index:
+                idx_2 = random.randint(0, self.__len__() - 1)
+            img_1, bboxes_1 = self.load_img_and_bboxes(index)   
+            img_2, bboxes_2 = self.load_img_and_bboxes(idx_2)   
+            img, bboxes = mixup_augmentation(img_1, bboxes_1, img_2, bboxes_2)
+        else:
+            img, bboxes = self.load_img_and_bboxes(index) 
+
+        bboxes = self.utils.xyxy_to_xywh(bboxes)    # Convert to XYWH, since transforms use different verino of XYWH and we'll do all calculations in XYXY
+
+        # print("Generated bboxes: ", bboxes)
+        # print(img[:, 2:4, 5:7])
 
         if self.transform:
             img = self.transform(img)
 
-        #--------------------------------------------------------------------------------------------------------------------
-        # Bounding Boxes
+        if self.target == 'yolo':
+            return self._build_deteciton_target_yolov4(img, bboxes)
+        else:
+            raise NotImplementedError("Only works for yolo for now")
 
-        annotations = target['labels']
-        bboxes = []
 
-
-        # Load image information (class and bounding box); convert bbox format (to x_c, y_c, w, h), keep them unscaled.
-        for obj in annotations:
-            obj_class = self.class_dict[obj['category']]
-            bbox = list(obj['box2d'].values())
-            bbox = self.utils.xyxy_to_xywh(bbox) 
-            if bbox[2] >= THRESH and bbox[3] >= THRESH:
-                box_tensor = torch.Tensor(([obj_class] + bbox.tolist()))
-                bboxes.append(box_tensor) 
+    def _build_deteciton_target_yolov4(self, img, bboxes):
 
         label = [torch.zeros(self.n_anchors_scale, Sy, Sx, self.C + 5) for Sy, Sx in self.S]  # array with n_anchors_scale (=3) tensors for each scale 
 
+        height, width = H, W                                            # Get the shape of the input image
+        
         for bbox in bboxes:
             obj_class, x, y, w, h = bbox.tolist()
             x, w = x / width, w / width                                         # Normalizing by the whole image size
@@ -136,75 +219,5 @@ class BDD100k(data.DataLoader):
             elif not exist and anchors_iou[anchor_idx] > self.ignore_iou_thresh:
                 label[scale_idx][anchor, i, j, self.C] = -1
 
-        # #--------------------------------------------------------------------------------------------------------------------
-        # #Lane Mask
-        # lane_name = os.path.splitext(target['name'])[0] + '.png'
-        # lane_path2 = self.lane_path + lane_name
+        return img, label, None
 
-        # lane_mask = read_image(self.lane_path + lane_name)
-        
-
-        # #Binary
-        # if self.transform:
-        #     lane_mask = self.transform(lane_mask)                                               # Transform the lane mask in the same way we transform our image
-        # lane_mask[lane_mask == 255.] = 1
-        # lane_mask = torch.where((lane_mask==0)|(lane_mask==1), lane_mask^1, lane_mask)
-
-        # #--------------------------------------------------------------------------------------------------------------------
-        # # Multi Class
-        # mask_image = torch.where(lane_mask != 255, 1, 0)
-        # category_image = torch.bitwise_and(lane_mask, 0x7) * mask_image + (mask_image - 1)
-        # crosswalk = (category_image == 0).to(torch.float32)
-        # double_other = (category_image == 1).to(torch.float32)
-        # double_white = (category_image == 2).to(torch.float32)
-        # double_yellow = (category_image == 3).to(torch.float32)
-        # road_curb = (category_image == 4).to(torch.float32)
-        # single_other = (category_image == 5).to(torch.float32)
-        # single_white = (category_image == 6).to(torch.float32)
-        # single_yellow = (category_image == 7).to(torch.float32)
-        # lane_background = (category_image == 8).to(torch.float32)
-        # lane = torch.stack([lane_background, single_yellow, single_white, single_other, road_curb,double_yellow, double_white, double_other, crosswalk], dim=0)
-        # # #--------------------------------------------------------------------------------------------------------------------
-
-        # #--------------------------------------------------------------------------------------------------------------------
-        # #Drivable Area
-        # drive_path = self.root + 'labels/drivable/masks/train/' if self.train else self.root + 'labels/drivable/masks/val/'
-        # drive_name = os.path.splitext(target['name'])[0] + '.png'
-        # drive_path2 = drive_path + drive_name
-        # drive_mask = read_image(drive_path + drive_name)
-
-        # if self.transform:
-        #     drive_mask = self.transform(drive_mask)[0]
-        # direct_mask = torch.where(drive_mask == 0, 1, 0)
-        # alternative_mask = torch.where(drive_mask == 1, 1, 0)
-        # drive_background = torch.where(drive_mask == 2, 1, 0)
-        # drivable = torch.stack([drive_background, direct_mask, alternative_mask], dim= 0)
-        # #--------------------------------------------------------------------------------------------------------------------
-
-        # seg = self._build_seg_target(lane_path2, drive_path2)
-
-        return img, label, 4
-
-
-    def _build_seg_target(self, lane_path, drivable_path):
-        '''Build groundtruth for  segmentation
-        Note: This combines the lanes and drivable masks into one
-        Args:
-            lane_path (str): path to lane binary mask
-            drivable_path (str): path to drivable binary mask
-        '''
-        lane = cv2.imread(lane_path)[..., 0]
-        drivable = cv2.imread(drivable_path)[..., 0]
-        lanes = np.bitwise_and(lane, 0b111)
-        lane_mask, drivable_mask = [], []
-        for i in range(9):
-            lane_mask.append(np.where(lanes==i, 1, 0))
-            if i in range(3):
-                drivable_mask.append(np.where(drivable==i, 1, 0))
-        lane_mask, drivable_mask = np.stack(lane_mask), np.stack(drivable_mask)
-        lane_mask = torch.tensor(lane_mask)
-        drivable_mask = torch.tensor(drivable_mask)
-        if self.transform:
-            lane_mask, drivable_mask = self.transform(lane_mask), self.transform(drivable_mask)
-        mask = torch.cat((lane_mask, drivable_mask), axis=0)
-        return mask

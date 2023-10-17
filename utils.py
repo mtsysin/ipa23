@@ -14,10 +14,17 @@ class DetectionUtils:
             bbox_: bounding box with format x, y, w, h if norm is False else the coordinates are normalized to the height and width of the image
         '''
         bbox_ = bbox.clone() if isinstance(bbox, torch.Tensor) else np.copy(bbox)
-        bbox_[0] = (bbox[0] + bbox[2]) / 2
-        bbox_[1] = (bbox[1] + bbox[3]) / 2
-        bbox_[2] = bbox[2] - bbox[0]
-        bbox_[3] = bbox[3] - bbox[1]
+        if isinstance(bbox, torch.Tensor):
+            bbox_[..., -4] = (bbox[..., -4] + bbox[..., -2]) / 2
+            bbox_[..., -3] = (bbox[..., -3] + bbox[..., -1]) / 2
+            bbox_[..., -2] = bbox[..., -2] - bbox[..., -4]
+            bbox_[..., -1] = bbox[..., -1] - bbox[..., -3]
+
+        else:
+            bbox_[0] = (bbox[0] + bbox[2]) / 2
+            bbox_[1] = (bbox[1] + bbox[3]) / 2
+            bbox_[2] = bbox[2] - bbox[0]
+            bbox_[3] = bbox[3] - bbox[1]
 
         return bbox_
 
@@ -30,10 +37,10 @@ class DetectionUtils:
             bbox_: bounding box with format x1, y2, x2, y2
         '''
         bbox_ = bbox.clone() if isinstance(bbox, torch.Tensor) else np.copy(bbox)
-        bbox_[:, 0] = (bbox[:, 0] - bbox[:, 2] / 2) 
-        bbox_[:, 1] = (bbox[:, 1] - bbox[:, 3] / 2)
-        bbox_[:, 2] = (bbox[:, 0] + bbox[:, 2] / 2) 
-        bbox_[:, 3] = (bbox[:, 1] + bbox[:, 3] / 2)
+        bbox_[..., 0] = (bbox[..., 0] - bbox[..., 2] / 2) 
+        bbox_[..., 1] = (bbox[..., 1] - bbox[..., 3] / 2)
+        bbox_[..., 2] = (bbox[..., 0] + bbox[..., 2] / 2) 
+        bbox_[..., 3] = (bbox[..., 1] + bbox[..., 3] / 2)
 
         return bbox_
     

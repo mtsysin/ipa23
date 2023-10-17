@@ -28,9 +28,9 @@ class TestBDD100k(unittest.TestCase):
         pass
 
     def test_single_process_dataloader(self):
-        train_dataset = BDD100k(root=BDD_100K_ROOT, train=True)
+        train_dataset = BDD100k(root=BDD_100K_ROOT, dataset_type = 'train')
         self._check_dataloader(train_dataset, num_workers=0)     
-        test_dataset = BDD100k(root=BDD_100K_ROOT, train=False)
+        test_dataset = BDD100k(root=BDD_100K_ROOT, dataset_type = 'val')
         self._check_dataloader(test_dataset, num_workers=0)
 
     def test_multi_process_dataloader(self):
@@ -75,30 +75,36 @@ class TestBDD100k(unittest.TestCase):
 
         imgs, dets, lanes, drives = next(iter(val_loader))
 
-    def test_dataset_scaling_and_reversion(self):
+    def test_dataset_scaling_and_reversion(self, indices, *args, **kwargs):
         """
         Dataset testing: get example outputs of the dataset
         Reverse-engineer the output of the dataset and get origianl images"
         """
         # Create dataset
         dataset = BDD100k(
-            root = BDD_100K_ROOT
+            root = BDD_100K_ROOT, 
+            *args,
+            **kwargs
         )
 
         C = len(CLASS_DICT)
 
         # Generate sample outputs of the dataset
-        for _ in range(1):
+        for idx in indices:
             # Get index from the dataset
-            # idx = np.random.randint(0, len(dataset))
-            idx = 0
-            image, label, seg = dataset[idx]
+            image, label, _ = dataset[idx]
             _, img_size_y, img_size_x = image.size()
 
             image = image.permute(1, 2, 0)
-            image = np.uint8(image)
 
+            # OpenCV complains that the image is not contiguous after the permute. Force it. 
+            # image = np.uint8(image)
+            image = np.ascontiguousarray(image, dtype=np.uint8)
+
+            print("Image type: ", type(image))
             print("Image size: ", image.shape)
+            print("Image range: ", image.min(), image.max())
+            print("Image snippet: ", image[4:6, 3:8, :])
             print("Label size: ", [l.size() for l in label])
             
             for scale_idx, l in enumerate(label):
@@ -116,7 +122,6 @@ class TestBDD100k(unittest.TestCase):
                 Sy, Sx = GRID_SCALES[scale_idx]                                                          # Get the output grid size for the chosen scale
 
                 # Show image and corresponding bounding boxes:
-                fig, ax = plt.subplots(1, 1)
                 for yolo_vector, position in zip(selected_igms, selected_igms_positions):
                     # get bbox values and convert them to scalars
                     x, y, w, h = yolo_vector[C+1:C+5].tolist()
@@ -124,7 +129,7 @@ class TestBDD100k(unittest.TestCase):
                     class_index = class_vector.index(1.0)
                     anchor_idx, y_idx, x_idx = position.tolist()
 
-                    # Select correct dimenstions
+                    # Select correct dimensions
                     print("old", x, y, w, h, x_idx, img_size_x, Sx)
                     x = int((x + x_idx) * img_size_x / Sx)
                     y = int((y + y_idx) * img_size_y / Sy)
@@ -132,15 +137,11 @@ class TestBDD100k(unittest.TestCase):
                     h = int(h * img_size_y / Sy)
 
                     print("new", x, y, w, h)
-                    # print(image)
                     image = cv2.rectangle(image, (int(x - w/2), int(y - h/2)), (int(x + w/2), int(y + h/2)), (36, 255, 12), 2) 
-                    image = cv2.putText(image, REVERSE_CLASS_DICT[class_index], (int(x), int(y - 10)), cv2.FONT_HERSHEY_SIMPLEX , 0.8, (36, 255, 12), 2)
+                    image = cv2.putText(image, REVERSE_CLASS_DICT[class_index], (int(x), int(y - 10)), cv2.FONT_HERSHEY_SIMPLEX , 0.3, (36, 255, 12), 2)
 
 
-            ax.imshow(image) 
-            ax.set_axis_off() 
-            plt.axis('tight') 
-            plt.savefig('out/test_dataset_scaling_and_reversion.png')
+            cv2.imwrite(f'out/test_dataset_scaling_and_reversion_{idx}.png', cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
 
 
     def _check_dataloader(self, data, num_workers):
