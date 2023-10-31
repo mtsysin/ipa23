@@ -1,131 +1,95 @@
 import argparse
+from pathlib import Path
 
-import os
 import numpy as np
 import torch
-import torchvision.transforms as transforms
-import torch.optim as optim
-import torch.utils.data as data
-from torch.utils.tensorboard import SummaryWriter
-import sys
-sys.path.append('../yolov4')
+from torch.utils.data import DataLoader, DistributedSampler
 
-from model.model import YoloMulti
-from bdd100k import BDD100k
-#from utils import non_max_supression, mean_average_precission, intersection_over_union
-from loss import MultiLoss, SegmentationLoss, DetectionLoss
-from utils import SegmentationMetric
-
-import matplotlib.pyplot as plt
-import tqdm
-
-from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter('runs/prototype_lane');
-
-device = torch.cuda.set_device(1)
-print(f"CUDA device: {torch.cuda.current_device()}")
-print(f"CUDA device count: {torch.cuda.device_count()}")
+import utils
+from models.detr import build_detr
 
 
-ANCHORS = [[(12,16),(19,36),(40,28)], [(36,75),(76,55),(72,146)], [(142,110),(192,243),(459,401)]]
+def get_args_parser():
+    parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
+    parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--epochs', default=300, type=int)
+    parser.add_argument('--device', default='cuda',
+                        help='device to use for training / testing')
 
-def parse_arg():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--device', type=str, default="cuda", help='cuda or cpu')
-    parser.add_argument('--batch', type=int, default=16, help='batch size')
-    parser.add_argument('--epoch', type=int, default=100, help='epochs')
-    parser.add_argument('--num_workers', type=int, default=12, help='number of workers')
-    # Fix root below
-    parser.add_argument('--root', type=str, default='/data/stevenwh/bdd100k/', help='root directory for both image and labels')
-    parser.add_argument('--cp', '-checkpoint', type=str, default='', help='path to checpoint of pretrained model')
-    return parser.parse_args()
+    # Backbone
+    parser.add_argument('--backbone', default='resnet50', type=str,
+                        help="Name of the convolutional backbone to use")
 
-def main():
-    args = parse_arg()
+    # Transformer
+    parser.add_argument('--enc_layers', default=6, type=int,
+                        help="Number of encoding layers in the transformer")
+    parser.add_argument('--dec_layers', default=6, type=int,
+                        help="Number of decoding layers in the transformer")
+    parser.add_argument('--dim_feedforward', default=2048, type=int,
+                        help="Intermediate size of the feedforward layers in the transformer blocks")
+    parser.add_argument('--hidden_dim', default=256, type=int,
+                        help="Size of the embeddings (dimension of the transformer)")
+    parser.add_argument('--dropout', default=0.1, type=float,
+                        help="Dropout applied in the transformer")
+    parser.add_argument('--nheads', default=8, type=int,
+                        help="Number of attention heads inside the transformer's attentions")
+    parser.add_argument('--num_queries', default=100, type=int,
+                        help="Number of query slots")
+    parser.add_argument('--pre_norm', action='store_true')
 
-    #Load model
-    model = YoloMulti().to(device)
-    metric = SegmentationMetric()
 
-    #Set optimizer and loss function
-    optimizer = optim.Adam(model.parameters(), lr=1e-4) # Can try 6e-4
+    # Loss coefficients
+    parser.add_argument('--set_cost_bbox', default=5, type=float,
+                        help="L1 box coefficient in the matching cost")
+    parser.add_argument('--set_cost_giou', default=2, type=float,
+                        help="giou box coefficient in the matching cost")
+    parser.add_argument('--mask_loss_coef', default=1, type=float)
+    parser.add_argument('--dice_loss_coef', default=1, type=float)
+    parser.add_argument('--bbox_loss_coef', default=5, type=float)
+    parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--eos_coef', default=0.1, type=float,
+                        help="Relative classification weight of the no-object class")
     
-    #loss_fn = MultiLoss()
-    loss_fn = SegmentationLoss()
+    return parser
 
-    transform = transforms.Compose([
-        transforms.Resize((384, 640), interpolation=transforms.InterpolationMode.NEAREST),
-    ])
-    #Load BDD100k Dataset
-    train_dataset = BDD100k(root='/data/stevenwh/bdd100k/', train=True, transform=transform, anchors=ANCHORS)
-    val_dataset = BDD100k(root='/data/stevenwh/bdd100k/', train=False, transform=transform, anchors=ANCHORS)
 
-    train_loader = data.DataLoader(dataset=train_dataset, 
-                                batch_size=args.batch,
-                                num_workers=args.num_workers,
-                                shuffle=True)
-    val_loader = data.DataLoader(dataset=val_dataset, 
-                                batch_size=args.batch,
-                                num_workers=args.num_workers,
-                                shuffle=False)
-                  
-    #imgs, det, seg = next(iter(train_loader)) # First batch
-    model.train()
-    groundtruths = [0] * (args.epoch*10)
-    counts = 0
+def main(args):
+    # Set torch device, default is cuda
+    device = torch.device(args.device)
+    # Build model, apply to torch device
+    model = build_detr(args)
+    model.to(device)
 
-    for epoch in tqdm.tqdm(range(args.epoch)):
-        #--------------------------------------------------------------------------------------
-        #Train
-        
-        for _ in range(4):
-            imgs, _, seg = next(iter(train_loader))
-            imgs, seg = imgs.to(device), seg.to(device) 
-            groundtruths[counts] = (imgs, seg)
-            counts += 1
-             
-            model.train()
-            running_loss = 0
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print('number of params:', n_parameters)
 
-            _, pseg = model(imgs)
-            
-            loss = loss_fn(pseg, seg.float())
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item()
-            writer.add_scalar("Loss/train", running_loss, epoch)
+    '''Pseudocode outline for training loop below:'''
 
-            writer.flush()
+    # Set optimizer and learning rate schedular
+    # optimizer = torch.optim.AdamW()
+    # lr_scheduler = torch.optim.lr_scheduler.StepLR()
+
+    # Get training and validation sections of dataset
+
+    # Get samplers from each section
+    # Then make batch sampler from training section sampler
+
+    # Create training and validation data loaders
+
+    # Set start time
+    # Start training: for epoch in range args.epochs
+    # - Train model
+    # - Step LR scheduler
+    # - Evaluate model
+    # - Record training time
     
-    # Inference on validation for evaluation
-    mean_iou = [0] * 12
-    iou_counts = [0] * 12
-    for i in range(len(groundtruths)):
-        imgs, seg = groundtruths[i]
-        imgs, seg = imgs.to(device), seg.to(device)  
-
-        _, pseg = model(imgs)
-        
-        iou = metric.mean_iou(seg, pseg, args.batch)
-        iou[iou == np.nan] = 0
-        mean_iou += iou
-        iou[iou != 0] = 1
-        iou_counts += iou
-        
-    print(np.divide(mean_iou, iou_counts))
-    
-    
-    '''
-    torch.save(model.state_dict(), 'out/model.pt')
-    torch.save(model, 'out/model.pth')
-    torch.save(imgs, 'out/imgs.pt')
-    torch.save(seg, 'out/seg.pt')
-    torch.save(pseg, 'out/pseg.pt')
-    '''
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
+    args = parser.parse_args()
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    main(args)
