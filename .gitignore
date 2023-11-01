@@ -1,0 +1,9 @@
+/runs/*
+nohup.out
+*/__pycache__/*
+/__pycache__/
+*.pt
+/bdd100k/*
+bdd100k*
+/out/*
+play.py
