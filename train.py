@@ -6,9 +6,6 @@ import torchvision.transforms as transforms
 import torch.optim as optim
 import torch.utils.data as data
 import torch.multiprocessing as mp
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP 
-from torch.distributed import init_process_group, destroy_process_group
 # from torch.utils.tensorboard import SummaryWriter
 
 from bdd100k import BDD100k, ANCHORS, BDD_100K_ROOT
@@ -69,15 +66,6 @@ print(torch.cuda.is_available())
 print(f"CUDA device: {torch.cuda.current_device()}")
 print(f"CUDA device count: {torch.cuda.device_count()}")
 
-def ddp_setup(rank: int, world_size: int):
-    """
-    Args:
-        rank: Unique identifier of each process
-        world_size: Total number of processes
-    """
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 def parse_arg():
     parser = argparse.ArgumentParser()
@@ -90,6 +78,11 @@ def parse_arg():
     parser.add_argument('--sched_points', nargs='+', type=int, default=SCHEDULER_PARAM, help='sheduler milestones list')
     parser.add_argument('--sched_gamma', type=int, default=SCHED_GAMMA, help='gamma for learning rate scheduler')
     parser.add_argument('--save', type=bool, default=True, help='save model flag')
+    parser.add_argument('--ddp', type=bool, default=True, help='save model flag')
+    parser.add_argument('--data_parallel', type=bool, default=True, help='save model flag')
+
+
+
     return parser.parse_args()
 
 # Initialize weights:
