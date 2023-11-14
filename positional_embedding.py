@@ -15,7 +15,6 @@ class NestedTensor(object):
         self.mask = mask
 
     def to(self, device):
-        # type: (Device) -> NestedTensor # noqa
         cast_tensor = self.tensors.to(device)
         mask = self.mask
         if mask is not None:
@@ -51,7 +50,7 @@ class PositionEmbeddingSine(nn.Module):
     """
     From "Attention is all you need", the fixed positional encodings are predefined as:
     - PE(pos, 2i) = sin(pos/10000^(2i/d_model))
-    - PE(pos, 2i) = cos(pos/10000^(2i/d_model))
+    - PE(pos, 2i+1) = cos(pos/10000^(2i/d_model))
     Where pos is the position and i is the dimensionality
 
     """
