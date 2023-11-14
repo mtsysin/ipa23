@@ -45,15 +45,24 @@ class BipartiteMatchingLoss(nn.Module):
         targ, targ_bbox = targets[0], targets[1]
 
         # Get matching indices
-        indices = self.bipartite_matching(pred_bbox, targ_bbox)
+        indices = self.bipartite_matching(preds, targets)
+        # gey number of boxes for normalizarion purposes:
+        num_boxes = torch.as_tensor(
+            [sum(len(t["labels"]) for t in targets)], 
+            dtype=torch.float, 
+            device=next(iter(preds.values())).device
+        )
         # Now we need to calculate the respective losses of both bboxes and labels. Note that we'll use our
         # weights to scale down the loss of the no-obkect class.
+        loss_class = self.compute_class_loss(preds, targets, indices)
+        loss_bbox, loss_ciou = self.compute_bbox_loss(preds, targets, indices, num_boxes)
+        losses = {
+            "loss_bbox": loss_bbox, 
+            "loss_class": loss_class, 
+            "loss_ciou": loss_ciou
+        }
 
-        # Compute class and bbox losses
-        class_loss = self.compute_class_loss(pred, targ, indices)
-        bbox_loss = self.compute_bbox_loss(pred_bbox, targ_bbox, indices)
-
-        return class_loss, bbox_loss
+        return losses
 
     def bipartite_matching(self, preds, targets, transform_bbox = lambda x: x):
         '''
@@ -120,6 +129,7 @@ class BipartiteMatchingLoss(nn.Module):
 
     def _convert_indices_permutation_to_target_mask(self, indices):
         # Essentially a list of batch numbers multiplied by the size of the target for each image
+        # Something like 1, 1, 1, 1, 2, 2, 2, 2, 2,2 , 3, 3, 3, 3....
         batch_idx = torch.cat([torch.full_like(target_permutation, i) for i, (_, target_permutation) in enumerate(indices)])
         # List of corresponding selected targets for each 
         target_idx = torch.cat([target_permutation for (_, target_permutation) in indices])
@@ -134,9 +144,9 @@ class BipartiteMatchingLoss(nn.Module):
 
     def compute_class_loss(self, preds, targets, indices, store_precision_at_k = None):
         '''
-            pred (Tensor): Predicted class probabilities
-            targ (Tensor): Target class labels.
-            indices (List): Indices for matching predicted and target boxes.
+            preds: See forward descriptions
+            targets: See forward descriptions
+            indices: See bipartite matching description
         '''
         # 1. Create a target calss tensor which will contain no_object (nclasses) class for all entries
         # Except for those which are in the matched indices. Shape is [num_preds_batch1 + num_preds_batch2 + ...]
@@ -144,7 +154,7 @@ class BipartiteMatchingLoss(nn.Module):
 
         pred_logits = preds[0]
         target_all_concat = torch.cat(
-            [targets[i] for i, (_, target_permutation) in enumerate(indices)]
+            [target_one_img[0][target_permutation] for target_one_img, (_, target_permutation) in zip(targets, indices)]
         )
         # Make a default target with "no_class" label and shape [batch_size, num_queries]
         target_classes = torch.full(pred_logits.shape[:2], self.num_classes,
@@ -161,23 +171,35 @@ class BipartiteMatchingLoss(nn.Module):
         return loss_class
     
 
-    def compute_bbox_loss(self, pred_bbox, targ_bbox, indices):
+    def compute_bbox_loss(self, preds, targets, indices, num_boxes):
         '''
-        Compute the bounding box regression loss.
-
-        Args:
-            out_bbox (Tensor): Predicted bounding boxes.
-            tgt_bbox (Tensor): Target bounding boxes.
-            indices (List): Indices for matching predicted and target boxes.
-
-        Returns:
-            Bounding box regression loss.
-
+            preds: See forward descriptions
+            targets: See forward descriptions
+            indices: See bipartite matching description
         '''
-        pred_boxes = pred_bbox[torch.arange(pred_bbox.shape[0])[:, None, None], torch.arange(pred_bbox.shape[1])[None, :, None], indices]
-        loss_bbox = 1 - self.ciou(pred_boxes, targ_bbox)
-        loss_bbox = loss_bbox.mean()
-        return loss_bbox
+        # Logic similar to the class loss. We only need to take care of bothe the l1 loss
+        # as wel as the CIOU loss.
+
+        # Get selected bboxes:
+        idx = self._convert_indices_permutation_to_target_mask(indices)
+        # Get pred bboxes for all queries
+        pred_bboxes = preds[1][idx]
+        # Get all target bboxes, shape [num_preds_batch1 + num_preds_batch2 + ..., 4]
+        target_bboxes_all_concat = torch.cat(
+            [target_one_img[0][target_permutation] for target_one_img, (_, target_permutation) in zip(targets, indices)],
+            dim=0
+        )
+        # Convert boxes to the indeed format:
+        loss_bbox = F.l1_loss(pred_bboxes, target_bboxes_all_concat, reduction='none') / num_boxes
+
+        loss_ciou = 1 - box_iou(
+            pred_bboxes,
+            target_bboxes_all_concat,
+            xyxy = False,
+            CIoU = True,
+            pairwise = False
+        )
+        return loss_bbox, loss_ciou
 
 
 def box_iou(box1, box2, xyxy=True, CIoU=True, pairwise = False):
@@ -248,3 +270,21 @@ def box_iou(box1, box2, xyxy=True, CIoU=True, pairwise = False):
         iou = iou - dist_penalty - aspect_ratio_penalty
     
     return iou.squeeze(-1)
+
+@torch.no_grad()
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    if target.numel() == 0:
+        return [torch.zeros([], device=output.device)]
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res

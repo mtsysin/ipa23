@@ -6,6 +6,29 @@ from typing import Optional
 from torch import Tensor
 import copy
 
+def mish(self, x):
+    return x * torch.tanh(torch.nn.functional.softplus(x))
+    # return self.relu(x)
+
+class FFN(nn.Module):
+    """ Very simple FFN"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, activation = F.relu):
+        super().__init__()
+        self.activation = activation
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(
+            nn.Linear(n, k)
+            for n, k in zip([input_dim] + h, h + [output_dim])
+        )
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = self.activation(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
+
+
 class DETREncoder(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super(DETREncoder, self).__init__()
