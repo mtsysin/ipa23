@@ -8,7 +8,6 @@ import copy
 
 def mish(self, x):
     return x * torch.tanh(torch.nn.functional.softplus(x))
-    # return self.relu(x)
 
 class FFN(nn.Module):
     """ Very simple FFN """
@@ -29,20 +28,20 @@ class FFN(nn.Module):
         return x
 
 
-class DETREncoder(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
-        super(DETREncoder, self).__init__()
+# class DETREncoder(nn.Module):
+#     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+#         super(DETREncoder, self).__init__()
 
-        self.c1 = DETREncoderLayer(d_model, nhead, dim_feedforward, dropout)
-        self.c2 = DETREncoderLayer(d_model, nhead, dim_feedforward, dropout)
-        self.c3 = DETREncoderLayer(d_model, nhead, dim_feedforward, dropout)
+#         self.c1 = DETREncoderLayer(d_model, nhead, dim_feedforward, dropout)
+#         self.c2 = DETREncoderLayer(d_model, nhead, dim_feedforward, dropout)
+#         self.c3 = DETREncoderLayer(d_model, nhead, dim_feedforward, dropout)
 
-    def forward(self, x, mask=None):
-        # Apply the layers sequentially
-        out = self.c1(x, src_key_padding_mask=mask)
-        out = self.c2(out, src_key_padding_mask=mask)
-        out = self.c3(out, src_key_padding_mask=mask)
-        return out
+#     def forward(self, x, mask=None):
+#         # Apply the layers sequentially
+#         out = self.c1(x, src_key_padding_mask=mask)
+#         out = self.c2(out, src_key_padding_mask=mask)
+#         out = self.c3(out, src_key_padding_mask=mask)
+#         return out
 
 
 class Transformer(nn.Module):
@@ -53,12 +52,12 @@ class Transformer(nn.Module):
                  return_intermediate_dec=False):
         super().__init__()
 
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+        encoder_layer = DETREncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+        decoder_layer = DETRDecoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
@@ -106,6 +105,7 @@ class TransformerEncoder(nn.Module):
                 pos: Optional[Tensor] = None):
         output = src
 
+        # Apply all layers sequentially
         for layer in self.layers:
             output = layer(output, 
                            src_mask=mask,
@@ -117,9 +117,10 @@ class TransformerEncoder(nn.Module):
 
 class TransformerDecoder(nn.Module):
 
-    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
+    def __init__(self, num_layers, decoder_block, norm=None, return_intermediate=False):
         super().__init__()
-        self.layers = _get_clones(decoder_layer, num_layers)
+        nn.ModuleList([copy.deepcopy(decoder_block) for _ in range(num_layers)])  # Stack together multiple 
+                                                                                                # encoder blocks
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
@@ -146,6 +147,7 @@ class TransformerDecoder(nn.Module):
 
         if self.norm is not None:
             output = self.norm(output)
+            # Update the last intermediate if we used norm at the end
             if self.return_intermediate:
                 intermediate.pop()
                 intermediate.append(output)
@@ -161,9 +163,13 @@ class DETREncoderLayer(nn.Module):
                  dim_feedforward=2048, 
                  dropout=0.1, 
                  use_custom_attention = False, 
-                 activation_func = None,
+                 activation_func = 'mish',
                  normalize_before = False
         ):
+        """
+        The meat of the encoder nework. Pretty much follows the picture form the paper
+        
+        """
         super(DETREncoderLayer, self).__init()
         self.normalize_before = normalize_before
         self.activation_func = activation_func
@@ -177,7 +183,6 @@ class DETREncoderLayer(nn.Module):
         
         # Layer normalization for self-attention output
         self.norm1 = nn.LayerNorm(d_model)
-
         
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -187,6 +192,8 @@ class DETREncoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
+
+        self.activation_finc = activation_dict[activation_func]
 
     
     def add_embedding(x, pos):
@@ -199,23 +206,27 @@ class DETREncoderLayer(nn.Module):
                 pos: Optional[Tensor] = None):
         """Performs a forward pass of an encoder layer with two options as described in the original impoementation"""
 
+        # Normalizes inputs as shown in the original attention os all you need.
         if self.normalize_before:
             src2 = self.norm1(src)
-            q = k = self.with_pos_embed(src2, pos)
-            src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
+            q = k = self.add_embedding(src2, pos)
+            src2 = self.multihead_atten(q, k, value=src2, attn_mask=src_mask,
                                 key_padding_mask=src_key_padding_mask)[0]
             src = src + self.dropout1(src2)
-            src2 = self.norm2(src)
+            src2 = self.norm2(src) # Normalizing before entering the second stage of the encoder module.
+            # No idea why they don't add an activatoin funciton after second linear layer
+            # Anyway, it's just a simple FFN with two layers
             src2 = self.linear2(self.dropout(self.activation_func(self.linear1(src2))))
             src = src + self.dropout2(src2)
-    
-        else: 
-            q = k = self.with_pos_embed(src, pos)
-            src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
+
+        # Unorthodox verison. Adds embeddings before normalizing the input layer.
+        else:
+            q = k = self.add_embedding(src, pos)
+            src2 = self.multihead_atten(q, k, value=src, attn_mask=src_mask,
                                 key_padding_mask=src_key_padding_mask)[0]
             src = src + self.dropout1(src2)
             src = self.norm1(src)
-            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+            src2 = self.linear2(self.dropout(self.activation_func(self.linear1(src))))
             src = src + self.dropout2(src2)
             src = self.norm2(src)
         
@@ -232,7 +243,7 @@ class DETRDecoderLayer(nn.Module):
         ):
         super(DETREncoderLayer, self).__init()
         self.normalize_before = normalize_before
-        self.activation_func = activation_func
+        self.activation_finc = activation_dict[activation_func]
         
         # Multi-Head Self-Attention
         if use_custom_attention:
@@ -274,8 +285,8 @@ class DETRDecoderLayer(nn.Module):
                                 key_padding_mask=tgt_key_padding_mask)[0]
             tgt = tgt + self.dropout1(tgt2)
             tgt2 = self.norm2(tgt)
-            tgt2 = self.multihead_atten(query=self.with_pos_embed(tgt2, query_pos),
-                                    key=self.with_pos_embed(memory, pos),
+            tgt2 = self.multihead_atten(query=self.add_embedding(tgt2, query_pos),
+                                    key=self.add_embedding(memory, pos),
                                     value=memory, attn_mask=memory_mask,
                                     key_padding_mask=memory_key_padding_mask)[0]
             tgt = tgt + self.dropout2(tgt2)
@@ -299,3 +310,9 @@ class DETRDecoderLayer(nn.Module):
             tgt = self.norm3(tgt)
         return tgt
 
+activation_dict = {
+    'relu': F.relu,
+    'gelu': F.gelu,
+    'glu': F.glu,
+    'mish': F.mish,
+}

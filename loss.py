@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from typing import Tuple, List
 from torch import Tensor
-from utils import xywh_to_xyxy
+from utils import xywh_to_xyxy, box_iou, accuracy
 
 class BipartiteMatchingLoss(nn.Module):
     def __init__(self, num_classes, empty_obj_coef = 0.1, class_lambda = 1.0, bbox_lambda = 1.0, iou_lambda = 1.0):
@@ -200,91 +200,3 @@ class BipartiteMatchingLoss(nn.Module):
             pairwise = False
         )
         return loss_bbox, loss_ciou
-
-
-def box_iou(box1, box2, xyxy=True, CIoU=True, pairwise = False):
-    """
-    Calculates IOU fucntionality
-    If pairwise, will generate a pair from [..., M, 4] and [..., N, 4] to [..., M, N]
-    Args:
-        box1 (tensor): bounding box 1
-        box2 (tensor): bounding box 2
-        xyxy (bool): is format of boudning box in x1 y1 x2 y2
-        CIoU (bool): if true calculate CIoU else IoU
-    Returns:
-        Tensor int the format:
-        [..., iou_value]
-    """
-
-    EPS = 1e-6
-
-    if not xyxy:
-        box1 = xywh_to_xyxy(box1)
-        box2 = xywh_to_xyxy(box2)
-
-    if pairwise:
-        box1 = box1[..., :, None, :] # [..., M, *N, 4]
-        box2 = box2[..., None, :, :] # [..., *M, N, 4]
-
-    box1_x1 = box1[..., 0:1]
-    box1_y1 = box1[..., 1:2]
-    box1_x2 = box1[..., 2:3]
-    box1_y2 = box1[..., 3:4]
-    box2_x1 = box2[..., 0:1]
-    box2_y1 = box2[..., 1:2]
-    box2_x2 = box2[..., 2:3]
-    box2_y2 = box2[..., 3:4]
-
-    x1 = torch.max(box1_x1, box2_x1)
-    y1 = torch.max(box1_y1, box2_y1)
-    x2 = torch.min(box1_x2, box2_x2)
-    y2 = torch.min(box1_y2, box2_y2)
-
-    intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
-    box1_width, box1_height = box1_x2 - box1_x1, box1_y2 - box1_y1
-    box2_width, box2_height = box2_x2 - box2_x1, box2_y2 - box2_y1
-    union = box1_width * box1_height + box2_width * box2_height - intersection
-    iou = intersection / (union + EPS)
-
-    if CIoU:
-        '''
-        Complete-IOU Loss Implementation
-        - Inspired by the official paper on Distance-IOU Loss (https://arxiv.org/pdf/1911.08287.pdf)
-        - Combines multiple factors for bounding box regression: IOU loss, distance loss, and aspect ratio loss.
-        - This results in much faster convergence than traditional IOU and generalized-IOU loss functions.
-        Args:
-            - preds: prediction tensor containing confidence scores for each class.
-            - target: ground truth containing correct class labels.
-        '''
-        convex_width = torch.max(box1_x2, box2_x2) - torch.min(box1_x1, box2_x1)
-        convex_height = torch.max(box1_y2, box2_y2) - torch.min(box1_y1, box2_y1)
-        convex_diag_sq = convex_width**2 + convex_height**2
-        center_dist_sq = (box2_x1 + box2_x2 - box1_x1 - box1_x2)**2 + (box2_y1 + box2_y2 - box1_y1 - box1_y2)**2
-        dist_penalty = center_dist_sq / (convex_diag_sq + EPS) / 4 
-
-        v = (4 / (torch.pi**2)) * torch.pow(torch.atan(box2_width / (box2_height + EPS)) - torch.atan(box1_width / (box1_height + EPS)), 2)
-        with torch.no_grad():
-            alpha = v / ((1 + EPS) - iou + v)
-        aspect_ratio_penalty = alpha * v
-        
-        iou = iou - dist_penalty - aspect_ratio_penalty
-    
-    return iou.squeeze(-1)
-
-@torch.no_grad()
-def accuracy(output, target, topk=(1,)):
-    """Computes the precision@k for the specified values of k"""
-    if target.numel() == 0:
-        return [torch.zeros([], device=output.device)]
-    maxk = max(topk)
-    batch_size = target.size(0)
-
-    _, pred = output.topk(maxk, 1, True, True)
-    pred = pred.t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-    res = []
-    for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
-        res.append(correct_k.mul_(100.0 / batch_size))
-    return res
