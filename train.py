@@ -23,11 +23,9 @@ import matplotlib.pyplot as plt
 import tqdm
 import math
 import ddp
-from model import get_model
+from LaneDetection_F23.model.model import get_model
 
 def get_args_parser():
-
-
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--debug', action='store_true', help='Slow, debug mode with some anomaly detections')
     parser.add_argument('--init_weight', action='store_true', help='Initialize weights with custom initializer')
@@ -285,9 +283,7 @@ def main():
             #--------------------------------------------------------------------------------------
             #Train
             train(model, loss_fn, train_loader, optimizer, device, epoch, args.clip_max_norm)
-
-            inner_tqdm.refresh() 
-            inner_tqdm.reset()
+            lr_scheduler.step()
 
             batches_accumulated = 0
             for i, (imgs, det, seg) in enumerate(train_loader):

@@ -114,14 +114,14 @@ class Joiner(nn.Sequential):
         super().__init__(backbone, position_embedding)
 
     def forward(self, tensor_list: NestedTensor):
-        #self[0] and self[1] refer to the baclbone and the encoder respectively.
+        #self[0] and self[1] refer to the backbone and the encoder respectively.
         # This is just inherited from nn.Sequential.
         xs = self[0](tensor_list)
         out: List[NestedTensor] = []
         pos = []
         for _, x in xs.items():
             out.append(x)
-            # Generate positional embeddings for each feature map
+            # Generate positional embeddings for each feature map (for each intermediate layer essentially)
             pos.append(self[1](x).to(x.tensors.dtype))
 
         return out, pos
