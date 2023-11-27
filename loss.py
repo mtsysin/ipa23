@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from typing import Tuple, List
 from torch import Tensor
-from utils import xywh_to_xyxy, box_iou, accuracy
+from utils import box_iou, accuracy
 
 class BipartiteMatchingLoss(nn.Module):
     def __init__(self, num_classes, empty_obj_coef = 0.1, class_lambda = 1.0, bbox_lambda = 1.0, iou_lambda = 1.0):
@@ -17,12 +17,13 @@ class BipartiteMatchingLoss(nn.Module):
         self.bbox_lambda = bbox_lambda
         self.iou_lambda = iou_lambda
         self.num_classes = num_classes
+        self.empty_obj_coef = empty_obj_coef
 
         # Buffer to store the relative weight of the classes. All of them are one except for the last one
         self.register_buffer(
             'class_weights', torch.cat(
-                torch.ones(self.num_classes), 
-                torch.tensor([self.eos_coef])
+                (torch.ones(self.num_classes),  torch.tensor([self.empty_obj_coef])),
+                dim = -1
             )
         )
 
@@ -40,17 +41,13 @@ class BipartiteMatchingLoss(nn.Module):
 
         Returns: Tuple of class loss and bounding box loss.
         '''
-        # Unpack predictions
-        pred, pred_bbox = preds[0], preds[1]
-        targ, targ_bbox = targets[0], targets[1]
-
         # Get matching indices
         indices = self.bipartite_matching(preds, targets)
-        # gey number of boxes for normalizarion purposes:
+        # geе number of boxes for normalizarion purposes:
         num_boxes = torch.as_tensor(
-            [sum(len(t["labels"]) for t in targets)], 
+            [sum(len(t[0]) for t in targets)], 
             dtype=torch.float, 
-            device=next(iter(preds.values())).device
+            device=next(iter(preds)).device
         )
         # Now we need to calculate the respective losses of both bboxes and labels. Note that we'll use our
         # weights to scale down the loss of the no-obkect class.
@@ -75,7 +72,6 @@ class BipartiteMatchingLoss(nn.Module):
                 - index_j is the indices of the corresponding selected targets (in order)
             For each batch element, it holds:
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
-
         '''
 
         batch_size, num_queries = preds[0].shape[:2]
@@ -91,7 +87,6 @@ class BipartiteMatchingLoss(nn.Module):
         # Compute the classification cost. Here we just approximate with
         # (1 - predicted prpbability of true class)
         # The 1 is a constant that doesn't change the matching, it can be ommitted.
-        print(out_prob.shape,tgt_ids.shape )
         cost_class = -out_prob[:, tgt_ids] # [batch_size * num_queries, 1], only one class prob
 
         # Compute the L1 cost between boxes
@@ -109,7 +104,8 @@ class BipartiteMatchingLoss(nn.Module):
         # Return
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
     
-    def apply_permutation(self, preds, targets, indices):
+    @staticmethod
+    def apply_permutation(preds, targets, indices):
         '''
             preds: See forward description
             targets: See forward description
@@ -127,7 +123,8 @@ class BipartiteMatchingLoss(nn.Module):
             targets[1][indices[i][1], :] # bboxes
         ) for i, (labels, box) in enumerate(targets)]
 
-    def _convert_indices_permutation_to_target_mask(self, indices):
+    @staticmethod
+    def _convert_indices_permutation_to_target_mask(indices):
         # Essentially a list of batch numbers multiplied by the size of the target for each image
         # Something like 1, 1, 1, 1, 2, 2, 2, 2, 2,2 , 3, 3, 3, 3....
         batch_idx = torch.cat([torch.full_like(target_permutation, i) for i, (_, target_permutation) in enumerate(indices)])
@@ -135,7 +132,8 @@ class BipartiteMatchingLoss(nn.Module):
         target_idx = torch.cat([target_permutation for (_, target_permutation) in indices])
         return batch_idx, target_idx
     
-    def _get_precision_at_k(self, selected_logits, selected_classes):
+    @staticmethod
+    def _get_precision_at_k(selected_logits, selected_classes):
         '''
         Takes selected logits from predictions and selected targets and returns the accuracy
         '''
@@ -161,7 +159,10 @@ class BipartiteMatchingLoss(nn.Module):
                             dtype=torch.int64, device=pred_logits.device)
         # Populate the selected queries from the matcher:
         target_indices = self._convert_indices_permutation_to_target_mask(indices)
-        target_classes[target_indices] = target_all_concat
+        print(target_all_concat.shape)
+        print(target_classes.shape)
+
+        target_classes[target_indices] = target_all_concat.squeeze(-1)
 
         loss_class = F.cross_entropy(pred_logits.permute(0, 2, 1), target_classes, weight=self.class_weights)
 
@@ -186,11 +187,11 @@ class BipartiteMatchingLoss(nn.Module):
         pred_bboxes = preds[1][idx]
         # Get all target bboxes, shape [num_preds_batch1 + num_preds_batch2 + ..., 4]
         target_bboxes_all_concat = torch.cat(
-            [target_one_img[0][target_permutation] for target_one_img, (_, target_permutation) in zip(targets, indices)],
+            [target_one_img[1][target_permutation] for target_one_img, (_, target_permutation) in zip(targets, indices)],
             dim=0
         )
         # Convert boxes to the indeed format:
-        loss_bbox = F.l1_loss(pred_bboxes, target_bboxes_all_concat, reduction='none') / num_boxes
+        loss_bbox = F.l1_loss(pred_bboxes, target_bboxes_all_concat, reduction='none').sum() / num_boxes
 
         loss_ciou = 1 - box_iou(
             pred_bboxes,
@@ -199,4 +200,5 @@ class BipartiteMatchingLoss(nn.Module):
             CIoU = True,
             pairwise = False
         )
+        loss_ciou = loss_ciou.sum() / num_boxes
         return loss_bbox, loss_ciou

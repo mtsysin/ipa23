@@ -4,6 +4,7 @@ from torch.distributed import init_process_group, destroy_process_group
 import os
 import torch.distributed as torchdist
 import torch
+import torch.utils.data as data
 
 """Most of the stuff here is directly or indirectly stolen from facebook DETR"""
 

@@ -32,7 +32,6 @@ def test_matching():
     )
 
     hm = BipartiteMatchingLoss()
-
     out = hm.bipartite_matching(preds, targets)
 
     print(len(out))
@@ -53,10 +52,7 @@ def test_iou():
     b2 = torch.rand(N, 4)
 
     print("b1, b2 shape ", b1.shape, b2.shape)
-
-
     out = box_iou(b1, b2, pairwise=True)
-
     print("out.shape: ", out.shape)
 
 
@@ -104,12 +100,94 @@ def test_transformer():
     mask = torch.rand(B, H, W)
     query_embed = nn.Embedding(num_queries, hidden_dim)
     pos_embed = torch.rand(B, hidden_dim, H, W)
-    print(123123)
     
     hs = transformer(src, mask, query_embed.weight, pos_embed)[0]
 
     print("Output of the transformer (Should be\
           num_intermediate, batch, num_queries, d_model): ", hs.shape)
+    
+def test_backbone():
+    from model.feature_extractor import build_backbone
+    from misc import NestedTensor
+
+    B = 16
+    H, W = 720, 1080
+    args = argparse.Namespace()
+    args.lr_backbone = 0.001
+    args.masks = False
+    args.dilation = False
+    args.backbone = 'resnet50'
+    args.hidden_dim = 512
+    args.position_embedding = 'sine'
+
+    backbone = build_backbone(args)
+
+    src = torch.rand(B, 3, H, W)
+    mask = torch.rand(B, H, W) > 0.5 ## Make some boolean array
+    x = NestedTensor(src, mask)
+
+    out = backbone(x)
+
+    print("Shapes of the intermediate outputs and positional encodings is equal to ", [o.tensors.shape for o in out[0]], 
+          [o.mask.shape for o in out[0]],  [o.shape for o in out[1]])
+
+def test_detr():
+    from model.model import build_detr
+    from misc import NestedTensor
+
+    B = 16
+    H, W = 720, 1080
+    args = argparse.Namespace()
+    args.lr_backbone = 0.001
+    args.masks = False
+    args.dilation = False
+    args.backbone = 'resnet50'
+    args.hidden_dim = 512
+    args.position_embedding = 'sine'
+    args.num_classes = 13
+    args.num_queries = 90
+    args.aux_loss = False
+    args.pre_norm = False
+    args.enc_layers = 6
+    args.dec_layers = 6
+    args.dim_feedforward = 2048
+    args.dropout = 0.1
+    args.nheads = 8
+
+    detr = build_detr(args)
+
+    src = torch.rand(B, 3, H, W)
+    mask = torch.rand(B, H, W) > 0.5 ## Make some boolean array
+    x = NestedTensor(src, mask)
+
+    out = detr(x)
+    print("Shapes of the bboxes and logits of the DETR are equal to ", out["pred_logits"].shape, out['pred_boxes'].shape)
+
+def test_loss():
+    from loss import BipartiteMatchingLoss
+
+    # Create loss
+    num_classes = 13
+    loss = BipartiteMatchingLoss(num_classes)
+    batch_size = 16
+    num_queries = 70
+    num_classes = 13
+
+    targets = []
+    for _ in range(batch_size):
+        s = random.randint(5, 10)
+        targets.append((
+            torch.randint(0, num_classes, (s, 1)),
+            torch.rand(s, 4),
+        ))
+    preds = (
+        torch.rand(batch_size, num_queries, num_classes+1), # logits
+        torch.rand(batch_size, num_queries, 4), # bbox
+    )
+
+    out = loss(preds, targets)
+
+    print("Output of the loss: ", out)
 
 if __name__== "__main__":
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])

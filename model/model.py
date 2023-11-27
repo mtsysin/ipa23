@@ -2,15 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from attention import MultiHeadAttention
-from typing import Optional
+from typing import Union, Optional
 from torch import Tensor
 import copy
+from misc import nested_tensor_from_tensor_list, NestedTensor
+from model.feature_extractor import build_backbone
+
+"""Most of the stuff is directly or indiectly taken fomr the original implementation"""
 
 def mish(x):
     return x * torch.tanh(torch.nn.functional.softplus(x))
 
 class FFN(nn.Module):
-    """ Very simple FFN """
+    """ Very simple FFN mainly used to calculate box embeddings"""
 
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers, activation = F.relu):
         super().__init__()
@@ -27,6 +31,99 @@ class FFN(nn.Module):
             x = self.activation(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
+def build_detr(args):
+
+    backbone = build_backbone(args)
+    transformer = Transformer(
+        d_model=args.hidden_dim,
+        dropout=args.dropout,
+        nhead=args.nheads,
+        dim_feedforward=args.dim_feedforward,
+        num_encoder_layers=args.enc_layers,
+        num_decoder_layers=args.dec_layers,
+        normalize_before=args.pre_norm,
+        return_intermediate_dec=True,
+    )
+
+    model = DETR(
+        backbone,
+        transformer,
+        num_classes=args.num_classes,
+        num_queries=args.num_queries,
+        aux_loss=args.aux_loss,
+    )
+
+    return model
+
+
+class DETR(nn.Module):
+    """ This is the DETR module that performs object detection """
+    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+        """ Initializes the model.
+        Parameters:
+            backbone: torch module of the backbone to be used. See backbone.py
+            transformer: torch module of the transformer architecture. See transformer.py
+            num_classes: number of object classes
+            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
+                         DETR can detect in a single image. For COCO, we recommend 100 queries.
+            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+        """
+        super().__init__()
+        self.num_queries = num_queries
+        self.transformer = transformer
+        hidden_dim = transformer.d_model
+        # Inidialize the embeddings that take trhe outputs of the transofrmer and return the class vector
+        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        # Initializes a simple FFN that takes the output of the transformer and creates the values for the bounding boxes
+        self.bbox_embed = FFN(hidden_dim, hidden_dim, 4, 3)
+        # This is for the initilization of  the query vector. We create an embedding and act on it with th 
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
+        self.backbone = backbone
+        self.aux_loss = aux_loss
+
+    def forward(self, samples: Union[NestedTensor, list, torch.Tensor]):
+        """Input: NestedTensor:
+               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
+               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+                                                                        that were artificially added to make images the same size
+
+            It returns a dict with the following elements:
+               - "pred_logits": the classification logits (including no-object) for all queries.
+                                Shape= [batch_size, num_queries, (num_classes + 1)]
+               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
+                               (center_x, center_y, height, width). These values are normalized in [0, 1],
+                               relative to the size of each individual image (disregarding possible padding).
+                               See PostProcess for information on how to retrieve the unnormalized bounding box.
+        """
+        # Convert to nested tensor if necessary
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = self.backbone(samples)
+
+        # Get the last output of the (intermediate) feature fom the feature extractor
+        src, mask = features[-1].decompose()
+        assert mask is not None
+        # Get the output of the decoder, shape num_intermediate, batch, num_queries, d_model
+        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+
+        # Get class embeddings: 
+        outputs_class = self.class_embed(hs)
+        outputs_coord = self.bbox_embed(hs).sigmoid()
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+
+        # Not really needed
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+        return out
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_coord):
+        # this is a workaround to make torchscript happy, as torchscript
+        # doesn't support dictionary with non-homogeneous values, such
+        # as a dict having both a Tensor and a list.
+        return [{'pred_logits': a, 'pred_boxes': b}
+                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
 class Transformer(nn.Module):
 
@@ -53,6 +150,7 @@ class Transformer(nn.Module):
         self.nhead = nhead
 
     def _reset_parameters(self):
+        """Funciton to reinitialize parameters with Xabier initialization"""
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
