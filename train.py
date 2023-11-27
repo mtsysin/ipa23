@@ -14,8 +14,7 @@ import torch.multiprocessing as mp
 
 from bdd100k_lightweight import BDD100k_DETR
 #from utils import non_max_supression, mean_average_precission, intersection_over_union
-from loss import MultiLoss, SegmentationLoss, DetectionLoss
-from utils import Reduce_255
+from loss import BipartiteMatchingLoss
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -23,15 +22,18 @@ import matplotlib.pyplot as plt
 import tqdm
 import math
 import ddp
-from LaneDetection_F23.model.model import get_model
+from model.model import build_detr
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--debug', action='store_true', help='Slow, debug mode with some anomaly detections')
-    parser.add_argument('--init_weight', action='store_true', help='Initialize weights with custom initializer')
+    parser.add_argument('--eval', action='store_true')
+
+    parser.add_argument('--init_weights', action='store_true', help='Initialize weights with custom initializer')
 
     parser.add_argument('--root', type=str, default='./bdd100k', help='root directory for both image and labels')
-
+    parser.add_argument('--output_dir', default='/data/mtsysin/ipa/LaneDetection_F23/out',
+                        help='path where to save, empty for no saving')
 
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--batch_size', default=8, type=int)
@@ -39,16 +41,21 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parallelization_options = ['none', 'ddp', 'dp']
-    parser.add_argument('--parallelization', type=str, choices=parallelization_options, default = 'ddp',
+    parser.add_argument('--parallelization', type=str, choices=parallelization_options, default = 'none',
                         help='Choose parallelization: none, dp, ddp')
-    parser.add_argument('--gpus', type=int, nargs="+", default=[0, 1, 2, 3], 
+    parser.add_argument('--gpu_list', type=int, nargs="+", default=[0, 1, 2, 3], 
                         help='number of workers for dataloader') # this will be mostly needed for the pure data parallel.
+    parser.add_argument('--num_classes', default=13, type=int,
+                        help="Number of classes in the model")
+    parser.add_argument('--weight_decay', default=1e-4, type=float)
 
 
     # Backbone
     parser.add_argument('--backbone', default='resnet50', type=str,
                         help="Name of the convolutional backbone to use")
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
+    parser.add_argument('--backbone_weight_decay', default=1e-4, type=float)
+
 
 
     # Transformer
@@ -67,6 +74,8 @@ def get_args_parser():
     parser.add_argument('--num_queries', default=100, type=int,
                         help="Number of query slots")
     parser.add_argument('--pre_norm', action='store_true')
+    parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
+                    help="Type of positional embedding to use on top of the image features")
 
 
     # Loss coefficients
@@ -83,19 +92,20 @@ def get_args_parser():
 
     # Training utils
     parser.add_argument('--num_workers', type=int, default=2, help='number of workers for dataloader')
-    parser.add_argument('--cp', '-checkpoint', type=str, default='', help='path to checpoint of pretrained model')
+    parser.add_argument('-checkpoint', type=str, default='', help='path to checpoint of pretrained model')
     optimizer_options = ['adam', 'adamw', 'sgd']
-    parser.add_argument('--opt', '-optimizer', type=str, choices=optimizer_options, default = 'adamw',
+    parser.add_argument('-optimizer', type=str, choices=optimizer_options, default = 'adamw',
                     help='optimizer used for training')
     scheduler_options = ['no', 'cyclic', 'step', 'multistep', 'cosine']
-    parser.add_argument('--sched', '-scheduler', type=str, choices=scheduler_options, default = 'step',
+    parser.add_argument('-scheduler', type=str, choices=scheduler_options, default = 'step',
                     help='scheduler used for training')
-    parser.add_argument('--lr_step', default=200, type=int)
+    parser.add_argument('--lr_step_size', default=200, type=int)
     parser.add_argument('--sched_points', nargs='+', type=int, default=[150, 400, 1000, 2000], help='sheduler milestones list')
     parser.add_argument('--sched_gamma', type=int, default=0.2, help='gamma for learning rate scheduler')
     parser.add_argument('-seed', type=int, default=None, help='seed for reproducing behavior')
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                     help='gradient clipping max norm')
+    parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
 
     # Augmentation control:
     parser.add_argument('--bbox_size_threshold', default=None, type=float) # Ignore small bounding boxes
@@ -103,16 +113,12 @@ def get_args_parser():
     parser.add_argument('--augment_prob', default=0.5, type=float)
     parser.add_argument('--mixup_after_mosaic_prob', default=0, type=float)
     parser.add_argument('--mixup_prob', default=0.3, type=float)
+    parser.add_argument('-train_size', type=int, default=None, help='seed for reproducing behavior')
+    parser.add_argument('-val_size', type=int, default=None, help='seed for reproducing behavior')
+
 
     return parser
 
-
-def parse_arg():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--cp', '-checkpoint', type=str, default='', help='path to checpoint of pretrained model')
-    parser.add_argument('--save', type=bool, default=True, help='save model flag')
-
-    return parser.parse_args()
 
 # Initialize weights:
 def weights_init(m):
@@ -123,8 +129,20 @@ def weights_init(m):
         torch.nn.init.normal_(m.weight.data, 1.0, 0.5)
         torch.nn.init.constant_(m.bias.data, 0)
 
-def main():
-    args = parse_arg()
+def main(args):
+    args = get_args_parser().parse_args()
+
+    print("CUDA availablilty:", torch.cuda.is_available()) 
+    print(f"CUDA device: {torch.cuda.current_device()}")
+    print(f"CUDA device count: {torch.cuda.device_count()}")
+
+    print("Parsed Args:")
+    print(args)
+    if args.parallelization == 'ddp':
+        ddp.init_distributed_mode(args)   
+    else:
+        args.distributed = False 
+        
     print("Parsed Args:")
     print(args)
 
@@ -132,15 +150,9 @@ def main():
         torch.autograd.detect_anomaly(True)
         torch.autograd.set_detect_anomaly(True, check_nan=True)
 
-    if args.parallelization == 'ddp':
-        ddp.init_distributed_mode(args)
-
     if "cuda" in args.device:
         torch.cuda.empty_cache()
     device = torch.device(args.device)
-    print("CUDA availablilty:", torch.cuda.is_available()) 
-    print(f"CUDA device: {torch.cuda.current_device()}")
-    print(f"CUDA device count: {torch.cuda.device_count()}")
 
     if args.seed:
         seed = args.seed + ddp.get_rank()
@@ -148,7 +160,9 @@ def main():
         np.random.seed(seed)
         random.seed(seed)
 
-    model, loss_fn = get_model(args) ## get model somehow
+    model = build_detr(args) ## get model somehow
+    loss_fn = BipartiteMatchingLoss(args.num_classes)
+
     model.to(device)
 
     #Load model
@@ -167,7 +181,7 @@ def main():
     #Set optimizer, loss function, and learning rate scheduler
     #We acn use weight decays for trining the backbone
 
-    pg_default, pg_backbone_weight, pg_backbone_bias, pg_bias =  [], [], [], [], []  # optimizer parameter groups
+    pg_default, pg_backbone_weight, pg_backbone_bias, pg_bias =  [], [], [], []  # optimizer parameter groups
     for name, param in bare_model.named_parameters():
         if param.requires_grad:
             if 'backbone' in name:
@@ -278,50 +292,28 @@ def main():
 
         for epoch in tqdm.tqdm(range(args.start_epoch, args.epochs)):
             if args.distributed:
-                train_loader.sampler.set_epoch(epoch)
-            running_loss = 0.0
-            #--------------------------------------------------------------------------------------
+                train_loader.sampler.set_epoch(epoch)    
             #Train
             train(model, loss_fn, train_loader, optimizer, device, epoch, args.clip_max_norm)
             lr_scheduler.step()
 
-            batches_accumulated = 0
-            for i, (imgs, det, seg) in enumerate(train_loader):
-                
-                batches_accumulated += 1
-                
-                imgs, seg = imgs.to(device), seg.to(device)
-                det = [d.to(device) for d in det]
-
-                det_pred, _ = model(imgs)
-
-                loss, loss_info = loss_fn(det_pred, det)
-                loss.backward()
-
-            
-                if batches_accumulated == BATCH_ACCUMULATION:
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    batches_accumulated = 0
-                    running_loss += loss.item()
-
-                # writer.add_scalar("Loss/train", running_loss, epoch)
-                # print(f"[epoch: {epoch + 1}, batch: {i + 1}] loss: {loss.item()}, components: {loss_info}")
-
-                if ((i+1) % BATCH_ACCUMULATION) == 0 and ((i+1) // BATCH_ACCUMULATION) % LOSS_COUNT_TRAIN == 0:
-                    file_log.set_description_str(
-                        f"[epoch: {epoch + 1}, batch: {i + 1}] loss: {running_loss / LOSS_COUNT_TRAIN}, components: {loss_info}"
-                    )
-                    # print(f"[epoch: {epoch + 1}, batch: {i + 1}] loss: {running_loss / LOSS_COUNT_TRAIN}, components: {loss_info}")
-                    losses.append(running_loss / LOSS_COUNT_TRAIN)
-                    running_loss = 0.0
-
-                inner_tqdm.update(1)
-
-                if SCHED_STEP == "batch":
-                    scheduler.step()
+            if args.output_dir:
+                checkpoint_paths = os.path.join(args.output_dir, 'checkpoint.pth')
+                # extra checkpoint before LR drop and every 100 epochs
+                if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
+                    checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
+                for checkpoint_path in checkpoint_paths:
+                    if ddp.is_main_process():
+                        torch.save({
+                            'model': bare_model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            'args': args,
+                        }, checkpoint_path)
 
             # Evaluation code
+            # TODO: finish this stuff
             model.eval()
             running_val_loss = 0.0
             with torch.no_grad():
@@ -336,37 +328,12 @@ def main():
 
                     running_val_loss += val_loss.item()
 
-                    if ((i+1)) % LOSS_COUNT_VAL == 0:
-                        val_losses.append(running_val_loss / LOSS_COUNT_VAL)
+                    if ((i+1)) % 10 == 0:
+                        val_losses.append(running_val_loss / 10)
                         file_log.set_description_str(
-                            "[VALIIDATION, epoch: %d, batch: %5d] loss: %.3f" % (epoch + 1, i + 1, running_val_loss/LOSS_COUNT_VAL)
+                            "[VALIIDATION, epoch: %d, batch: %5d] loss: %.3f" % (epoch + 1, i + 1, running_val_loss/10)
                         )
                         running_val_loss = 0.0
-
-
-        outer_tqdm.update(1)
-        # writer.flush()
-
-        if SCHED_STEP == "epoch":
-            scheduler.step()
-
-    if args.save:
-        print("Saving the model")
-        torch.save(model.state_dict(), ROOT+f"/model_{epochs}_{args.batch}.pt")
-        if USE_PARALLEL:
-            torch.save(model.module.state_dict(), ROOT+f"/model_{epochs}_{args.batch}_parallel.pt")
-
-    return losses, val_losses
-    
-    # untransform = transforms.Compose([
-    #     transforms.Resize((720, 1280), interpolation=transforms.InterpolationMode.NEAREST),
-    # ])
-    # imgs = untransform(imgs)
-    # seg = untransform(seg)
-    # pseg = untransform(pseg)
-    # torch.save(imgs, 'imgs.pt')
-    # torch.save(seg, 'seg.pt')
-    # torch.save(pseg, 'pseg.pt')
 
 
 def train(
@@ -412,38 +379,40 @@ def train(
             )
 
 
-# def eval(
-#         model: torch.nn.Module,
-#         loss_fn: torch.nn.Module,
-#         val_loader, 
-#         device: torch.device, 
-#         epoch: int, 
-#         max_norm: float = 0
-#     ):
+def evaluate(
+        model: torch.nn.Module,
+        loss_fn: torch.nn.Module,
+        val_loader, 
+        device: torch.device, 
+        epoch: int, 
+        max_norm: float = 0
+    ):
 
-#     model.eval()
-#     loss_fn.eval()
+    model.eval()
+    loss_fn.eval()
 
-#     for i, (imgs, targets) in tqdm.tqdm(enumerate(val_loader)):
-#         imgs = imgs.to(device)
-#         targets = tuple(t.to(device) for t in targets)
+    for i, (imgs, targets) in tqdm.tqdm(enumerate(val_loader)):
+        imgs = imgs.to(device)
+        targets = tuple(t.to(device) for t in targets)
 
-#         outputs = model(imgs)
-#         loss_dict, weight_dict = loss_fn(outputs, targets)
+        outputs = model(imgs)
+        loss_dict, weight_dict = loss_fn(outputs, targets)
 
-#         # reduce losses over all GPUs for logging purposes (stolen from DETR)
-#         loss_dict_reduced = ddp.reduce_dict(loss_dict)
-#         loss_dict_reduced_unscaled = {f'{k}_unscaled': v
-#                                       for k, v in loss_dict_reduced.items()}
-#         loss_dict_reduced_scaled = {k: v * weight_dict[k]
-#                                     for k, v in loss_dict_reduced.items() if k in weight_dict}
-#         losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
-#         loss_value = losses_reduced_scaled.item()
+        # reduce losses over all GPUs for logging purposes (stolen from DETR)
+        loss_dict_reduced = ddp.reduce_dict(loss_dict)
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
+                                      for k, v in loss_dict_reduced.items()}
+        loss_dict_reduced_scaled = {k: v * weight_dict[k]
+                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
+        losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
+        loss_value = losses_reduced_scaled.item()
 
-#         if (i+1) % 10 == 0:
-#             file_log.set_description_str(
-#                 f"[epoch: {epoch + 1}, batch: {i + 1}] loss: {loss_value}, components: {loss_dict_reduced_unscaled}"
-#             )
+        #TODO: finish this, it doesn't work
+
+        # if (i+1) % 10 == 0:
+        #     file_log.set_description_str(
+        #         f"[epoch: {epoch + 1}, batch: {i + 1}] loss: {loss_value}, components: {loss_dict_reduced_unscaled}"
+        #     )
     
 
 if __name__ == '__main__':

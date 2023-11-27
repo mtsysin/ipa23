@@ -11,6 +11,9 @@ def xyxy_to_xywh(x):
     Args:
     - x: tuple of two bounding box coordinates (top left, bottom right corners)
     '''
+    if isinstance(x, tuple) or isinstance(x, list):
+        x1, y1, x2, y2 = x
+        return (x1 + x2) / 2,  (y1 + y2) / 2, x2-x1, y2-y1
     y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
     y[..., 0] = (x[..., 0] + x[..., 2]) / 2  # x center
     y[..., 1] = (x[..., 1] + x[..., 3]) / 2  # y center
@@ -20,10 +23,15 @@ def xyxy_to_xywh(x):
 
 def xywh_to_xyxy(x):
     '''
-    Convert x1, y1, w, h format to xyxt format
+    Convert x1, y1, w, h format to xyxy format
     Args:
     - x: tuple of bounding box coordinates (top left point, width, height)
     '''
+    if isinstance(x, tuple) or isinstance(x, list):
+        x, y, w, h = x
+        w/=2
+        h/=2
+        return x - w,  y - h, x + w,  y + h
     y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
     y[..., 0] = x[..., 0] - x[..., 2] / 2  # x1
     y[..., 1] = x[..., 1] - x[..., 3] / 2  # y1

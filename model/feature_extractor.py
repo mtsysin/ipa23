@@ -134,9 +134,9 @@ def build_backbone(args):
     # Build positional encoding
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
-    return_interm_layers = args.masks
+    return_interm_layers = False  # TODO:  Generalize it, now force to 0, origianlly was args.masks
     # Construct the backbone with intermediate feature layers if required
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, False) # Dont use dilation as original paper optionally does
     # Combine backbone features with positional embeddings
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels

@@ -1,17 +1,15 @@
 import os
-
+import random
 import pandas as pd
-
 import torch
+
 import torch.utils.data as data
 from torchvision.io import read_image
-from PIL import Image
 from pathlib import Path
 
 from torchvision.transforms import v2 as transforms
-from torchvision import tv_tensors
 from augmentation import mosaic_augmentation, cls_bbox_augment, mixup_augmentation
-import random
+from utils import xyxy_to_xywh
 
 CLASS_DICT = {
             'pedestrian' : 1,
@@ -43,9 +41,11 @@ class BDD100k_DETR(data.DataLoader):
         self.mixup_prob = args.mixup_prob
 
         self.base_transform = transforms.Compose([
+            transforms.ToDtype(torch.float32), 
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
-        
+        self.img_path = self.root / f'images/100k/{image_set}'
+
     def __len__(self):
         return len(self.detect.index)
     
@@ -57,7 +57,7 @@ class BDD100k_DETR(data.DataLoader):
         for obj in annotations:
             obj_class = self.class_dict[obj['category']]
             bbox = list(obj['box2d'].values())
-            _, _, w, h = self.utils.xyxy_to_xywh(bbox) 
+            _, _, w, h = xyxy_to_xywh(bbox) 
             if self.bbox_size_threshold and (w < self.bbox_size_threshold or h < self.bbox_size_threshold):
                 continue
             bbox_tensor = torch.Tensor(bbox)
@@ -68,7 +68,7 @@ class BDD100k_DETR(data.DataLoader):
                 torch.stack(classes).to(enforced_type) if enforced_type else torch.stack(classes))
     
     def load_img_and_bboxes(self, index, enforced_bbox_type = None):
-        img = read_image(self.img_path + self.detect.iloc[index]['name'])
+        img = read_image(str(self.img_path / self.detect.iloc[index]['name']))
         bboxes, classes = self.load_cls_bboxes(index, enforced_type=enforced_bbox_type)
         
         _, height, width = img.shape

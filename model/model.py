@@ -50,7 +50,8 @@ def build_detr(args):
         transformer,
         num_classes=args.num_classes,
         num_queries=args.num_queries,
-        aux_loss=args.aux_loss,
+        # TODO: figure out auxilary loss later
+        aux_loss=False #args.aux_loss,
     )
 
     return model
