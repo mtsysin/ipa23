@@ -61,6 +61,7 @@ class BipartiteMatchingLoss(nn.Module):
 
         return losses
 
+    @torch.no_grad()
     def bipartite_matching(self, preds, targets, transform_bbox = lambda x: x):
         '''
             preds: See forward description
@@ -159,8 +160,6 @@ class BipartiteMatchingLoss(nn.Module):
                             dtype=torch.int64, device=pred_logits.device)
         # Populate the selected queries from the matcher:
         target_indices = self._convert_indices_permutation_to_target_mask(indices)
-        print(target_all_concat.shape)
-        print(target_classes.shape)
 
         target_classes[target_indices] = target_all_concat.squeeze(-1)
 

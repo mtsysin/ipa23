@@ -25,7 +25,7 @@ def mixup_augmentation(im1, boxes1, clases1, im2, boxes2, classes2, ratio = 32.0
     Labels are just stacked togeter
     """
     lamd = np.random.beta(ratio, ratio)  # mixup ratio, see paper https://arxiv.org/pdf/1710.09412.pdf
-    im = (im1 * lamd + im2 * (1 - lamd)).to(torch.uint8)
+    im = (im1 * lamd + im2 * (1 - lamd)).to(im1.dtype)
     boxes = torch.cat((boxes1, boxes2), -2)
     classes = torch.cat((clases1, classes2), -2)
     return im, boxes, classes

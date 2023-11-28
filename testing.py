@@ -7,7 +7,7 @@ import random
 import argparse
 
 
-def get_args_parser():
+def get_args_parser_local():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--test', '-t', default='none', type=str)
     return parser
@@ -185,11 +185,28 @@ def test_loss():
         torch.rand(batch_size, num_queries, 4), # bbox
     )
 
+    print(f"Targets dtype {[t.dtype for t in targets[0]]}")
+    print(f"Preds dtype {[t.dtype for t in preds]}")
+
     out = loss(preds, targets)
 
     print("Output of the loss: ", out)
 
+
+def test_dataset():
+    from bdd100k_lightweight import BDD100k_DETR
+    from train import get_args_parser as get_args_parser_main
+    args_testing = get_args_parser_main().parse_args([])
+
+    # Create dataset:
+    ds = BDD100k_DETR(args_testing)
+    out = ds[3]
+    classes, bbox = out[1]
+    print(bbox, classes)
+    print()
+    # print("The output of the dataset is: ", out)
+
 if __name__== "__main__":
-    parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser_local()])
     args = parser.parse_args()
     locals()[f"test_{args.test}"]()

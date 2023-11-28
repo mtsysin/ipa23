@@ -17,12 +17,13 @@ from bdd100k_lightweight import BDD100k_DETR
 from loss import BipartiteMatchingLoss
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DistributedSampler
 import matplotlib.pyplot as plt
 import tqdm
 import math
 import ddp
 from model.model import build_detr
+from misc import collate_fn
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
@@ -36,7 +37,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
 
     parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--batch_size', default=8, type=int)
+    parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -86,7 +87,7 @@ def get_args_parser():
     parser.add_argument('--mask_loss_coef', default=1, type=float)
     parser.add_argument('--dice_loss_coef', default=1, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--ciou_loss_coef', default=2, type=float)
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
 
@@ -136,8 +137,6 @@ def main(args):
     print(f"CUDA device: {torch.cuda.current_device()}")
     print(f"CUDA device count: {torch.cuda.device_count()}")
 
-    print("Parsed Args:")
-    print(args)
     if args.parallelization == 'ddp':
         ddp.init_distributed_mode(args)   
     else:
@@ -161,7 +160,8 @@ def main(args):
         random.seed(seed)
 
     model = build_detr(args) ## get model somehow
-    loss_fn = BipartiteMatchingLoss(args.num_classes)
+    loss_fn = BipartiteMatchingLoss(args.num_classes).to(device)
+    weight_dict = {'loss_class': 1, 'loss_bbox': args.bbox_loss_coef, 'loss_giou': args.ciou_loss_coef}
 
     model.to(device)
 
@@ -251,14 +251,14 @@ def main(args):
                                 drop_last = True,
                                 num_workers=args.num_workers,
                                 sampler = train_sampler,
-                                collate_fn = None
+                                collate_fn = collate_fn
     )
 
     val_loader = data.DataLoader(dataset=val_dataset, 
                                 batch_size=args.batch_size,
                                 num_workers=args.num_workers,
                                 sampler= val_sampler,
-                                collate_fn = None                           # TODO: make collator
+                                collate_fn = collate_fn                           # TODO: make collator
 
     )
 
@@ -294,13 +294,13 @@ def main(args):
             if args.distributed:
                 train_loader.sampler.set_epoch(epoch)    
             #Train
-            train(model, loss_fn, train_loader, optimizer, device, epoch, args.clip_max_norm)
+            train(model, loss_fn, train_loader, optimizer, device, epoch, args.clip_max_norm, weight_dict)
             lr_scheduler.step()
 
             if args.output_dir:
                 checkpoint_paths = os.path.join(args.output_dir, 'checkpoint.pth')
                 # extra checkpoint before LR drop and every 100 epochs
-                if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
+                if (epoch + 1) % args.lr_step_size == 0 or (epoch + 1) % 100 == 0:
                     checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
                 for checkpoint_path in checkpoint_paths:
                     if ddp.is_main_process():
@@ -343,7 +343,8 @@ def train(
         optimizer: torch.optim.Optimizer,
         device: torch.device, 
         epoch: int, 
-        max_norm: float = 0
+        max_norm: float = 0,
+        weight_dict: dict = {}
     ):
     model.train()
     loss_fn.train()
@@ -352,9 +353,10 @@ def train(
 
     for i, (imgs, targets) in tqdm.tqdm(enumerate(train_loader)):
         imgs = imgs.to(device)
-        targets = tuple(t.to(device) for t in targets)
+        targets = [tuple(el.to(device) for el in target) for target in targets]
         outputs = model(imgs)
-        loss_dict, weight_dict = loss_fn(outputs, targets)
+        outputs = (outputs["pred_logits"], outputs["pred_boxes"])
+        loss_dict = loss_fn(outputs, targets)
         loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         optimizer.zero_grad()
         loss.backward()

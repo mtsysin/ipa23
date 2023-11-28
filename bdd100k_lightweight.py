@@ -49,7 +49,7 @@ class BDD100k_DETR(data.DataLoader):
     def __len__(self):
         return len(self.detect.index)
     
-    def load_cls_bboxes(self, index, enforced_type = None):
+    def load_cls_bboxes(self, index, enforced_class_type = torch.int64, enforced_bbox_type = None):
         # Load image information (class and bounding box); convert bbox format (to x_c, y_c, w, h), keep them unscaled.
         annotations = self.detect.iloc[index]['labels']
         bboxes = []
@@ -64,21 +64,18 @@ class BDD100k_DETR(data.DataLoader):
             cls_tensor = torch.Tensor([obj_class])
             bboxes.append(bbox_tensor)
             classes.append(cls_tensor)
-        return (torch.stack(bboxes).to(enforced_type) if enforced_type else torch.stack(bboxes),
-                torch.stack(classes).to(enforced_type) if enforced_type else torch.stack(classes))
+        return (torch.stack(bboxes).to(enforced_bbox_type) if enforced_bbox_type else torch.stack(bboxes),
+                torch.stack(classes).to(enforced_class_type) if enforced_class_type else torch.stack(classes))
     
-    def load_img_and_bboxes(self, index, enforced_bbox_type = None):
+    def load_img_and_bboxes(self, index, enforced_class_type = torch.int64):
         img = read_image(str(self.img_path / self.detect.iloc[index]['name']))
-        bboxes, classes = self.load_cls_bboxes(index, enforced_type=enforced_bbox_type)
+        bboxes, classes = self.load_cls_bboxes(index, enforced_class_type=enforced_class_type)
         
         _, height, width = img.shape
-
-        augmentation_scheme = self._get_augmentation_scheme((height, width))
-
         if random.random() < self.augment_prob:
+            augmentation_scheme = self._get_augmentation_scheme((height, width))
             img, bboxes, classes = cls_bbox_augment(augmentation_scheme, img, bboxes, classes)
-        else:
-            img, bboxes, classes = self.base_transform(img, bboxes, classes)
+        img, bboxes, classes = cls_bbox_augment(self.base_transform, img, bboxes, classes)
 
         return img, bboxes, classes
     
@@ -91,11 +88,10 @@ class BDD100k_DETR(data.DataLoader):
                 transforms.ClampBoundingBoxes(),
                 transforms.SanitizeBoundingBoxes(),
                 transforms.RandomPhotometricDistort(),
-                self.base_transform
             ])
         else:
-            return self.base_transform
-
+            return transforms.Compose([])
+        
     def load_mosaic(self, base_index):
         # get random indices to build a mosaic augmentation:
         idxs = [base_index]
@@ -109,13 +105,12 @@ class BDD100k_DETR(data.DataLoader):
         return mosaic_augmentation(images, bboxes_l, classes_l)
 
     def __getitem__(self, index):
-        target = self.detect.iloc[index]
 
         if random.random() < self.mosaic_prob:               # Run mosaic
             img, bboxes, classes = self.load_mosaic(index)
             if random.random() < self.mixup_after_mosaic_prob:       # Run mixup with mosaics
                 img_2, bboxes_2, classes_2 = self.load_mosaic(random.randint(0, self.__len__() - 1))
-                img, bboxes = mixup_augmentation(img, bboxes, classes, img_2, bboxes_2, classes_2)
+                img, bboxes, classes = mixup_augmentation(img, bboxes, classes, img_2, bboxes_2, classes_2)
         elif random.random() < self.mixup_prob / (1 - self.mosaic_prob):      # Just run simple augmentations
             # Choose another index:
             idx_2 = index
@@ -123,8 +118,8 @@ class BDD100k_DETR(data.DataLoader):
                 idx_2 = random.randint(0, self.__len__() - 1)
             img_1, bboxes_1, classes_1 = self.load_img_and_bboxes(index)   
             img_2, bboxes_2, classes_2 = self.load_img_and_bboxes(idx_2)   
-            img, bboxes = mixup_augmentation(img_1, bboxes_1, classes_1, img_2, bboxes_2, classes_2)
+            img, bboxes, classes = mixup_augmentation(img_1, bboxes_1, classes_1, img_2, bboxes_2, classes_2)
         else:
             img, bboxes, classes = self.load_img_and_bboxes(index)
 
-        return img, (bboxes, classes)
+        return img, (classes, bboxes) # need to swap for consistency
