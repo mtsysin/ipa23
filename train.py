@@ -13,6 +13,7 @@ import torch.multiprocessing as mp
 # from torch.utils.tensorboard import SummaryWriter
 
 from bdd100k_lightweight import BDD100k_DETR
+from torchvision.models.detection import CocoEvaluator
 #from utils import non_max_supression, mean_average_precission, intersection_over_union
 from loss import BipartiteMatchingLoss
 
@@ -24,6 +25,7 @@ import math
 import ddp
 from model.model import build_detr
 from misc import collate_fn
+from utils import accuracy
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
@@ -384,37 +386,39 @@ def train(
 def evaluate(
         model: torch.nn.Module,
         loss_fn: torch.nn.Module,
-        val_loader, 
-        device: torch.device, 
-        epoch: int, 
+        val_loader,
+        device: torch.device,
+        epoch: int,
         max_norm: float = 0
     ):
 
     model.eval()
     loss_fn.eval()
 
-    for i, (imgs, targets) in tqdm.tqdm(enumerate(val_loader)):
+    for i, (imgs, targets) in enumerate(val_loader):
         imgs = imgs.to(device)
         targets = tuple(t.to(device) for t in targets)
 
-        outputs = model(imgs)
-        loss_dict, weight_dict = loss_fn(outputs, targets)
+        with torch.no_grad():
+            outputs = model(imgs)
+            loss_dict, weight_dict = loss_fn(outputs, targets)
 
-        # reduce losses over all GPUs for logging purposes (stolen from DETR)
-        loss_dict_reduced = ddp.reduce_dict(loss_dict)
-        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
-                                      for k, v in loss_dict_reduced.items()}
-        loss_dict_reduced_scaled = {k: v * weight_dict[k]
-                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
-        losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
-        loss_value = losses_reduced_scaled.item()
+            # Reduce losses over all GPUs for logging purposes
+            loss_dict_reduced = ddp.reduce_dict(loss_dict)
+            loss_dict_reduced_scaled = {k: v * weight_dict[k]
+                                        for k, v in loss_dict_reduced.items() if k in weight_dict}
+            losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
+            loss_value = losses_reduced_scaled.item()
 
-        #TODO: finish this, it doesn't work
+            acc_results = accuracy(outputs, targets[0])
 
-        # if (i+1) % 10 == 0:
-        #     file_log.set_description_str(
-        #         f"[epoch: {epoch + 1}, batch: {i + 1}] loss: {loss_value}, components: {loss_dict_reduced_unscaled}"
-        #     )
+            # Log the loss, components, and accuracy at specific intervals
+            if (i+1) % 10 == 0:
+                components_str = {f'{k}_unscaled': v for k, v in loss_dict_reduced.items()}
+                description = f"[epoch: {epoch + 1}, batch: {i + 1}] loss: {loss_value}, components: {components_str}, accuracy@1: {acc_results[0]:.2f}"
+                tqdm.tqdm.write(description)
+
+
     
 
 if __name__ == '__main__':
