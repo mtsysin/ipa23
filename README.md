@@ -1,2 +1,0 @@
-# LaneDetection_F23
-
